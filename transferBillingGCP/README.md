@@ -59,6 +59,21 @@ Quando um objeto é criado no bucket S3 de origem, o Lambda:
 
 ---
 
+## Os 3 buckets envolvidos (não confundir)
+
+| Papel | Placeholder | Função |
+|---|---|---|
+| Origem (gatilho) | `<SOURCE_BUCKET>` | Onde os `.csv` de billing chegam e disparam o Lambda |
+| Destino (Google) | `<GCS_BUCKET>` | Bucket GCS para onde os arquivos são copiados |
+| Do zip (deploy) | `<CODE_BUCKET>` | Guarda apenas o `billing-gcs.zip` do código para subir no Lambda |
+
+O **bucket do zip** (`<CODE_BUCKET>`) **não faz parte do fluxo dos arquivos de billing** —
+ele só é usado na hora de fazer deploy/atualizar o código da função. O upload direto do
+pacote (~10 MB) para o Lambda costuma cair ("Connection was closed"), então o zip é
+enviado primeiro para esse bucket S3 e o Lambda o carrega de lá (ver `deploy.ps1`).
+
+---
+
 ## Variáveis de ambiente
 
 | Nome | Obrig. | Exemplo | Descrição |
