@@ -1,0 +1,5 @@
+# NUNCA commitar credenciais nem artefatos de build
+gcp-credentials.json
+*.json.key
+build/
+*.zip
