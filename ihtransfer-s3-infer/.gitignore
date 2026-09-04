@@ -3,3 +3,5 @@ gcp-credentials.json
 *.json.key
 build/
 *.zip
+__pycache__/
+*.pyc
