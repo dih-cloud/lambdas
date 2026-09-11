@@ -14,7 +14,6 @@ $Profile       = "eks-operator"
 $Region        = "us-east-2"
 $FunctionName  = "transferBillingGCP"
 $RoleName      = "<LAMBDA_ROLE_NAME>"
-$SourceBucket  = "<SOURCE_BUCKET>"                     # bucket de origem (gatilho S3)
 $CodeBucket    = "<CODE_BUCKET>"       # bucket p/ guardar o zip
 $CodeKey       = "transferBillingGCP/billing-gcs.zip"
 # ----------------------------------------------------------------------
@@ -39,20 +38,22 @@ aws lambda update-function-configuration `
     --region $Region --profile $Profile | Out-Null
 aws lambda wait function-updated --function-name $FunctionName --region $Region --profile $Profile
 
-Write-Host "==> Garantindo permissao s3:GetObject na role..." -ForegroundColor Cyan
+Write-Host "==> Garantindo permissao s3:GetObject na role (qualquer bucket)..." -ForegroundColor Cyan
+# Le de QUALQUER bucket de origem. Para restringir, troque o Resource por uma lista
+# de buckets especificos (ex.: "arn:aws:s3:::<SOURCE_BUCKET>/*").
 $policy = @"
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "ReadBillingSource", "Effect": "Allow",
+    { "Sid": "ReadAnyBillingSource", "Effect": "Allow",
       "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::$SourceBucket/*" }
+      "Resource": "arn:aws:s3:::*/*" }
   ]
 }
 "@
 $tmp = Join-Path $env:TEMP "s3policy.json"
 $policy | Out-File -FilePath $tmp -Encoding ascii -Force
-aws iam put-role-policy --role-name $RoleName --policy-name ReadShcIbccBillings `
+aws iam put-role-policy --role-name $RoleName --policy-name ReadAnyBillingSource `
     --policy-document "file://$tmp" --profile $Profile
 Remove-Item $tmp -Force
 

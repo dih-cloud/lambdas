@@ -5,7 +5,7 @@ próprio código, dependências e instruções de deploy.
 
 | Lambda | Descrição |
 |---|---|
-| [`transferBillingGCP`](transferBillingGCP/) | Copia arquivos de billing de um bucket S3 para o Google Cloud Storage quando chegam. |
+| [`transferBillingGCP`](transferBillingGCP/) | Copia arquivos com `billing` no nome de qualquer bucket S3 para o Google Cloud Storage (pasta billing-to-process) quando chegam. |
 | [`ihtransfer-s3-infer`](ihtransfer-s3-infer/) | Copia arquivos do S3 para o Google Cloud Storage, roteando para pasta diária ou histórica conforme marcadores no nome do arquivo. |
 
 > **Segurança:** credenciais (service accounts, tokens, access keys) **nunca** vão para
