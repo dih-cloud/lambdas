@@ -1,7 +1,8 @@
 # transferBillingGCP
 
 Lambda que copia arquivos de **billing** de qualquer bucket **S3 (AWS)** para um bucket
-**Google Cloud Storage**, disparado automaticamente quando o arquivo chega no S3.
+**Google Cloud Storage** e registra a data numa **planilha de acompanhamento**,
+disparado automaticamente quando o arquivo chega no S3.
 
 ---
 
@@ -17,7 +18,10 @@ Quando um objeto é criado num bucket S3 que tem o gatilho:
 
 1. Se o nome contém **`billing`** → copia para o bucket do Google. Se não contém → ignora.
 2. Sobe para `GCP_BUCKET`, na pasta `GCP_FOLDER` (ex.: `billing-to-process`).
-3. O objeto **original no S3 é sempre mantido** (não há delete).
+3. **Atualiza a planilha**: escreve a data de hoje (DD/MM/AAAA, fuso Brasil) na coluna
+   `Last Update Billing` da linha do hospital, casando pelo nome do arquivo (`cn` →
+   `Indice` → `Nome do hospital`, normalizado). Falha aqui **não** quebra a cópia.
+4. O objeto **original no S3 é sempre mantido** (não há delete).
 
 > O bucket de origem vem do **próprio evento**, então a mesma função atende **vários
 > buckets**: basta adicionar a notificação de evento apontando para este Lambda em cada
@@ -38,6 +42,7 @@ Quando um objeto é criado num bucket S3 que tem o gatilho:
 | Buckets de origem (gatilho) | qualquer bucket com notificação `s3:ObjectCreated:*` → este Lambda |
 | Bucket de destino (GCS) | `<GCS_BUCKET>` |
 | Pasta de destino | `billing-to-process` |
+| Planilha de acompanhamento | atualiza `Last Update Billing` na linha do hospital (SA separada) |
 
 ---
 
@@ -47,15 +52,23 @@ Quando um objeto é criado num bucket S3 que tem o gatilho:
 |---|---|---|---|
 | `GCP_BUCKET` | sim | `<GCS_BUCKET>` | Bucket GCS destino |
 | `GCP_FOLDER` | sim | `billing-to-process` | Pasta de destino |
-| `GCP_CREDENTIALS` | * | `{...json...}` | JSON da service account (uma linha, com os `\n`) |
-| `GCP_CREDENTIALS_SECRET_ARN` | * | `arn:aws:secretsmanager:...` | Alternativa mais segura ao `GCP_CREDENTIALS` |
-| `BILLING_KEYWORD` | não | `billing` | Palavra que dispara a cópia (default `billing`) |
+| `GCP_CREDENTIALS` | * | `{...json...}` | JSON da service account do **GCS** (uma linha, com os `\n`) |
+| `GCP_CREDENTIALS_SECRET_ARN` | * | `arn:aws:secretsmanager:...` | Alternativa ao `GCP_CREDENTIALS` |
+| `GCP_SHEETS_CREDENTIALS` | não | `{...json...}` | JSON de uma service account **separada** com acesso de Editor à planilha. Sem ela, o passo da planilha é pulado. |
+| `SHEET_ID` | não | `1hWrSe…` | ID real da planilha (do link `/d/<ID>/edit`). Necessária junto com `GCP_SHEETS_CREDENTIALS`. |
+| `SHEET_NAME` | não | `Página1` | Nome da aba; se ausente, usa a 1ª aba. |
+| `BILLING_KEYWORD` | não | `billing` | Palavra que dispara a cópia (default `billing`). |
 
-`*` = configure **uma** das duas formas de credencial. Se `GCP_CREDENTIALS_SECRET_ARN`
+`*` = configure **uma** das duas formas de credencial do GCS. Se `GCP_CREDENTIALS_SECRET_ARN`
 existir, ele tem prioridade e o `GCP_CREDENTIALS` é ignorado.
 
-A credencial do Google (`gcp-credentials.json`) **não** está no repositório — vive na env
-var `GCP_CREDENTIALS` da função (ou no Secrets Manager).
+As credenciais **não** ficam no repositório — vivem nas env vars da função (ou no Secrets
+Manager). São **duas contas separadas**: uma para o GCS (`GCP_CREDENTIALS`) e outra só para
+a planilha (`GCP_SHEETS_CREDENTIALS`).
+
+> **Limite de 4KB das env vars**: as duas credenciais juntas estouram os 4KB do Lambda.
+> Por isso os JSONs são gravados **enxutos** (só `private_key`, `client_email`, `token_uri`
+> e, no GCS, `project_id`) — o suficiente para o `google-auth` autenticar.
 
 ---
 
@@ -78,7 +91,7 @@ zip vai primeiro para o S3 e o Lambda o carrega de lá; ver `deploy.ps1`).
 | Arquivo | O quê |
 |---|---|
 | `lambda_function.py` | Código do Lambda (comentado) |
-| `requirements.txt` | Dependência: `google-cloud-storage` |
+| `requirements.txt` | Dependências: `google-cloud-storage` + `gspread` (planilha) |
 | `build.ps1` | Monta `billing-gcs.zip` com os wheels **Linux** (necessário p/ o Lambda) |
 | `deploy.ps1` | Sobe o zip via S3, ajusta timeout/memória e a permissão IAM |
 | `.gitignore` | Impede commit da credencial e de artefatos de build |
