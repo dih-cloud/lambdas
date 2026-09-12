@@ -104,8 +104,8 @@ def _norm(s):
 
 
 def _today_br():
-    # Brasil e' UTC-3 o ano todo (sem horario de verao desde 2019).
-    return (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%d/%m/%Y")
+    # Brasil e' UTC-3 o ano todo (sem horario de verao desde 2019). Data + hora.
+    return (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M")
 
 
 def _update_sheet_billing(filename):
