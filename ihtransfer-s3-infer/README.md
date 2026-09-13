@@ -1,7 +1,7 @@
 # ihtransfer-s3-infer
 
-Lambda que copia arquivos de um bucket **S3 (AWS)** para um bucket **Google Cloud
-Storage**, escolhendo a pasta de destino conforme o **nome do arquivo**. Disparada
+Lambda que copia arquivos de **CN** dos buckets S3 para um bucket **Google Cloud
+Storage** e registra a data numa **planilha de acompanhamento**, disparada
 automaticamente quando o arquivo chega no S3.
 
 ---
@@ -9,58 +9,62 @@ automaticamente quando o arquivo chega no S3.
 ## Visão geral
 
 ```
-       (ObjectCreated)
- <SOURCE_BUCKET> ───────────► Lambda ihtransfer-s3-infer ───────────► gs://<GCS_BUCKET>/<pasta>/<arquivo>
-   (bucket S3)                                                              (Google Cloud Storage)
+       (ObjectCreated, *.csv)
+ buckets shc-* (CN) ─────────► Lambda ihtransfer-s3-infer ─────────► gs://<GCS_BUCKET>/<pasta>/<arquivo>
+                                    (us-east-2)                             (Google Cloud Storage)
+                                        │
+                                        └──► planilha de acompanhamento: coluna "Last Update CN"
 ```
 
-Para cada arquivo que chega no S3:
+Para cada arquivo que chega:
 
-1. Decide a **pasta** de destino no GCS pelo nome do arquivo:
-   - contém algum marcador de `HISTORIC_FILENAME_MARKERS` (no código) → `GCP_FOLDER_HISTORIC`
+1. Copia para o bucket GCS `GCP_BUCKET`, escolhendo a pasta pelo nome do arquivo:
+   - contém algum marcador de `HISTORIC_FILENAME_MARKERS` → `GCP_FOLDER_HISTORIC`
    - caso contrário → `GCP_FOLDER`
-2. Baixa do S3 para `/tmp` e sobe para o bucket GCS (o **original no S3 é mantido**).
-3. Extrai um `doctor_name` do nome (2º campo separado por `_`) para um **registro
-   opcional** num Web App (Apps Script) — **desativado por padrão**.
+2. **Atualiza a planilha**: escreve a data de hoje (DD/MM/AAAA HH:MM, fuso Brasil) na
+   coluna **`Last Update CN`** da linha do hospital, casando pelo nome do arquivo
+   (`cn` → `Indice` → `Nome do hospital`, normalizado). Falha aqui **não** quebra a cópia.
+3. O objeto **original no S3 é sempre mantido**.
 
-> Diferente do `transferBillingGCP`, esta função **não** filtra por `billing`: ela
-> processa todos os arquivos do evento e roteia pela lista de marcadores.
+> É a mesma planilha usada pela `transferBillingGCP` — lá ela preenche `Last Update
+> Billing`; aqui, `Last Update CN`.
 
 ---
 
-## Marcadores de roteamento (no código)
+## Escopo atual (produção)
 
-A lista fica em `lambda_function.py`, logo abaixo dos imports, porque é editada com
-frequência:
+- Região implantada com o update de planilha: **us-east-2**.
+- Buckets de origem (gatilho `s3:ObjectCreated:*`, sufixo `.csv`): `shc-ibcc`,
+  `shc-uopeccan`, `shc-drarnaldo`, `shc-hmd`, `shc-ingest-imip`,
+  `shc-ingest-hac-angelina`, `shc-hospitalbompastor`. Arquivos no formato
+  `cn_<hospital>_<ts>.csv`.
+- Bucket GCS destino: `shc-infer-mt` (pastas `cns-for-processing` / `cns-to-process`).
 
-```python
-HISTORIC_FILENAME_MARKERS = (
-    "imip", "uopeccan", "ibcc", "felicio rocho", "amor",
-    "angelina", "arnaldo", "hmd", "hcor", "hbompastor",
-)
-```
-
-Comparação é case-insensitive (`casefold`). Se o nome do arquivo contém qualquer um
-desses textos, o arquivo vai para `GCP_FOLDER_HISTORIC`; senão, para `GCP_FOLDER`.
+> **Nota us-east-1**: existe uma cópia desta função em us-east-1 (buckets
+> `shc-hcor-patologia`, `shc-ingest-felicio-rocho`, `shc-ingest-hamor`) que **não** foi
+> alterada aqui e está com um bug de sintaxe pré-existente — fora do escopo desta versão.
+> Felício Rocho envia arquivos `DISP…` (sem `cn_<hospital>`), que **não** casam por nome.
 
 ---
 
 ## Variáveis de ambiente
 
-| Nome | Obrig. | Descrição |
-|---|---|---|
-| `GCP_CREDENTIALS` | sim | JSON da service account (uma linha, com os `\n`) |
-| `GCP_BUCKET` | sim | Bucket GCS de destino |
-| `GCP_FOLDER` | sim | Pasta padrão (arquivos "diários") |
-| `GCP_FOLDER_HISTORIC` | sim | Pasta para arquivos que batem com os marcadores |
-| `WEBAPP_URL` | não | URL do Web App (Apps Script) para o registro opcional. **Contém token secreto no path** — por isso fica em env var, nunca no código. Vazio = recurso desativado. |
+| Nome | Obrig. | Exemplo | Descrição |
+|---|---|---|---|
+| `GCP_CREDENTIALS` | sim | `{...json...}` | JSON da service account do **GCS** (bucket destino) |
+| `GCP_BUCKET` | sim | `shc-infer-mt` | Bucket GCS de destino |
+| `GCP_FOLDER` | sim | `cns-for-processing` | Pasta padrão |
+| `GCP_FOLDER_HISTORIC` | sim | `cns-to-process` | Pasta p/ arquivos que batem com os marcadores |
+| `GCP_SHEETS_CREDENTIALS` | não | `{...json...}` | JSON de uma service account **separada** com Editor na planilha. Sem ela, o passo da planilha é pulado. |
+| `SHEET_ID` | não | `1hWrSe…` | ID da planilha de acompanhamento (`/d/<ID>/edit`). |
+| `SHEET_NAME` | não | — | Nome da aba; se ausente, usa a 1ª aba. |
 
-> A função implantada também usa `SHEET_ID` / `SHEET_NAME` (variação do registro via
-> planilha). Esses não são consumidos por este código — o registro aqui é o bloco
-> opcional via `WEBAPP_URL`, que está comentado.
+As credenciais **não** ficam no repositório. São **duas contas separadas**: GCS
+(`GCP_CREDENTIALS`) e planilha (`GCP_SHEETS_CREDENTIALS`).
 
-A credencial do Google (`gcp-credentials.json`) **não** está no repositório — ela vive
-na env var `GCP_CREDENTIALS` (ou no Secrets Manager).
+> **Limite de 4KB das env vars**: as duas credenciais juntas estouram os 4KB do Lambda,
+> então os JSONs são gravados **enxutos** (só `private_key`, `client_email`, `token_uri`
+> e, no GCS, `project_id`) — o suficiente para o `google-auth` autenticar.
 
 ---
 
@@ -69,45 +73,16 @@ na env var `GCP_CREDENTIALS` (ou no Secrets Manager).
 | Arquivo | O quê |
 |---|---|
 | `lambda_function.py` | Código do Lambda (comentado) |
-| `requirements.txt` | `google-cloud-storage` + `requests` |
-| `build.ps1` | Monta `ihtransfer.zip` com os wheels **Linux** |
-| `deploy.ps1` | Sobe o zip via S3 e ajusta timeout/memória |
-| `.gitignore` | Impede commit da credencial e de artefatos de build |
+| `requirements.txt` | `google-cloud-storage` + `gspread` |
+| `build.ps1` | Monta o zip com wheels **Linux** |
+| `deploy.ps1` | Sobe o zip via S3 e ajusta a config |
+| `.gitignore` | Impede commit de credencial e artefatos de build |
 
----
-
-## Deploy / atualizar
-
-As dependências têm código nativo, então o pacote precisa ser montado com os **wheels
-do Linux** (alvo do Lambda), não os do Windows.
+## Deploy
 
 ```powershell
-# 1) montar o ihtransfer.zip (codigo + dependencias Linux)
 powershell -ExecutionPolicy Bypass -File .\build.ps1
-
-# 2) preencher os placeholders no deploy.ps1 e subir
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
 
-> Sem pip local? Dá para montar com Docker:
-> `docker run --rm -v ${PWD}:/var/task public.ecr.aws/sam/build-python3.12 pip install -r requirements.txt -t build`
-
-O `deploy.ps1` **não** mexe nas variáveis de ambiente (pra não expor segredos) — elas
-ficam no console do Lambda.
-
----
-
-## Config sugerida da função
-
-- Runtime: Python 3.12 · Handler `lambda_function.lambda_handler`
-- Timeout: 900 s · Memória: 512 MB · `/tmp`: 2 GB
-- Sem VPC (precisa de internet para alcançar o Google)
-- Role: `AWSLambdaBasicExecutionRole` + `s3:GetObject` no bucket de origem
-
----
-
-## Notas
-
-- Nome do arquivo é preservado no GCS: `<pasta>/<nome-original>`.
-- Nomes fora do formato `<a>_<doctor_name>_<resto>` são pulados (log "Formato inesperado").
-- O objeto original no S3 é mantido (só a cópia em `/tmp` é removida).
+As env vars (`GCP_*`, `SHEET_ID`) são definidas no console do Lambda — o deploy não as altera.

@@ -1,127 +1,170 @@
 # =============================================================================
-#  LAMBDA: ihtransfer-s3-infer  (S3  ->  Google Cloud Storage)
+#  LAMBDA: ihtransfer-s3-infer  (S3 -> Google Cloud Storage + update planilha CN)
 # =============================================================================
-#
-#  O QUE FAZ
-#  ---------
-#  Disparada por evento S3 (ObjectCreated). Para cada arquivo que chega:
-#    1) Decide a PASTA de destino no GCS pelo nome do arquivo:
+#  Disparada por evento S3 (ObjectCreated) nos buckets de CN.
+#  Para cada arquivo que chega:
+#    1) copia para o bucket GCS GCP_BUCKET, escolhendo a pasta pelo nome:
 #         - nome contem algum marcador de HISTORIC_FILENAME_MARKERS -> GCP_FOLDER_HISTORIC
 #         - caso contrario                                          -> GCP_FOLDER
-#    2) Baixa o arquivo do S3 para /tmp e sobe para o bucket do GCS.
-#    3) Extrai um "doctor_name" do nome do arquivo (2o campo separado por "_")
-#       para um registro OPCIONAL num Web App (Apps Script) -- desativado por padrao.
-#
+#    2) atualiza a planilha de acompanhamento: escreve a data de hoje
+#       (DD/MM/AAAA HH:MM) na coluna "Last Update CN" da linha do hospital,
+#       casando pelo nome do arquivo (cn -> Indice -> Nome do hospital).
 #  O objeto original no S3 e mantido (so a copia temporaria em /tmp e removida).
 #
 #
-#  IMPORTANTE - DEPENDENCIAS
-#  -------------------------
-#  Usa "google-cloud-storage" e "requests", que NAO vem no runtime do Lambda.
-#  E preciso empacotar via zip/Layer (ver build.ps1 / README).
-#
+#  DEPENDENCIAS: google-cloud-storage e gspread (empacotar via zip/Layer).
 #
 #  VARIAVEIS DE AMBIENTE
-#  ---------------------
-#    GCP_CREDENTIALS       (obrig.)  JSON da service account (string, com os \n)
+#    GCP_CREDENTIALS       (obrig.)  JSON da service account do GCS (bucket shc-infer-mt)
 #    GCP_BUCKET            (obrig.)  bucket GCS de destino
-#    GCP_FOLDER            (obrig.)  pasta padrao (arquivos "diarios")
+#    GCP_FOLDER            (obrig.)  pasta padrao
 #    GCP_FOLDER_HISTORIC   (obrig.)  pasta para arquivos que batem com os marcadores
-#    WEBAPP_URL            (opc.)    URL do Web App (Apps Script) p/ o registro
-#                                    opcional. Contem token secreto no path, por isso
-#                                    NAO fica hardcoded -> configurar por env var.
-#                                    Ex.: https://script.google.com/macros/s/<DEPLOY_ID>/exec
+#    -- planilha (opcionais; sem elas o passo da planilha e' pulado) --
+#    GCP_SHEETS_CREDENTIALS  JSON de uma service account com Editor na planilha
+#    SHEET_ID                ID da planilha de acompanhamento (/d/<ID>/edit)
+#    SHEET_NAME (opc)        nome da aba; default = 1a aba
 # =============================================================================
 
 import json
 import os
+import unicodedata
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import boto3
-import requests
+import gspread
 from google.cloud import storage
 from google.oauth2 import service_account
 
-# =============================================================================
-#  >>> EDITE AQUI <<<  Marcadores no nome do arquivo (case-insensitive).
-#  Se o nome do arquivo contem ALGUM destes textos, o arquivo vai para a pasta
-#  historica (GCP_FOLDER_HISTORIC). Caso contrario, vai para GCP_FOLDER.
-#  (Normalmente sao apelidos/identificadores de origem, ex.: nomes de hospitais.)
-# =============================================================================
+# Arquivos que tiverem qualquer um desses textos no nome vao para a pasta historica.
 HISTORIC_FILENAME_MARKERS = (
-    "imip",
-    "uopeccan",
-    "ibcc",
-    "felicio rocho",
-    "amor",
-    "angelina",
-    "arnaldo",
-    "hmd",
-    "hcor",
-    "hbompastor",
+    "imip", "uopeccan", "ibcc", "felicio rocho", "amor",
+    "angelina", "arnaldo", "hmd", "hcor", "hbompastor",
 )
+
+# Planilha: coluna a atualizar e colunas usadas para casar o hospital.
+CN_COL_HEADER = "Last Update CN"
+MATCH_COL_HEADERS = ("cn", "Indice", "Nome do hospital")
 
 s3_client = boto3.client("s3")
 
-# Cliente GCS montado a partir da service account fornecida na env var.
-GCP_CREDENTIALS_JSON = json.loads(os.environ["GCP_CREDENTIALS"])
-credentials = service_account.Credentials.from_service_account_info(GCP_CREDENTIALS_JSON)
-gcp_client = storage.Client(credentials=credentials)
-
-GCP_BUCKET = os.environ["GCP_BUCKET"]
-GCP_FOLDER = os.environ["GCP_FOLDER"]
-GCP_FOLDER_HISTORIC = os.environ["GCP_FOLDER_HISTORIC"]
-
-# URL do Web App (Apps Script) para o registro opcional. Fica FORA do codigo
-# porque o path carrega um token secreto -- configure em WEBAPP_URL. Vazio = desativado.
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
+_gcs_client = None
+_sheet_ws = None
 
 
-def resolve_gcp_folder(filename: str) -> str:
-    """Retorna a pasta de destino no GCS conforme os marcadores no nome."""
+# ---------------------------- GCS (upload) -----------------------------------
+def _get_gcs_client():
+    global _gcs_client
+    if _gcs_client is None:
+        info = json.loads(os.environ["GCP_CREDENTIALS"])
+        creds = service_account.Credentials.from_service_account_info(info)
+        _gcs_client = storage.Client(project=info.get("project_id"), credentials=creds)
+    return _gcs_client
+
+
+def resolve_gcp_folder(filename):
     normalized = filename.casefold()
-    if any(marker.casefold() in normalized for marker in HISTORIC_FILENAME_MARKERS):
-        return GCP_FOLDER_HISTORIC
-    return GCP_FOLDER
+    if any(m.casefold() in normalized for m in HISTORIC_FILENAME_MARKERS):
+        return os.environ["GCP_FOLDER_HISTORIC"]
+    return os.environ["GCP_FOLDER"]
 
 
+# ---------------------------- Planilha (Sheets) ------------------------------
+def _get_sheet_ws():
+    """Worksheet da planilha, ou None se as env vars da planilha nao existirem."""
+    global _sheet_ws
+    if _sheet_ws is None:
+        raw = os.environ.get("GCP_SHEETS_CREDENTIALS")
+        sheet_id = os.environ.get("SHEET_ID")
+        if not raw or not sheet_id:
+            return None
+        info = json.loads(raw)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
+        name = os.environ.get("SHEET_NAME")
+        _sheet_ws = sh.worksheet(name) if name else sh.sheet1
+    return _sheet_ws
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def _today_br():
+    # Brasil e' UTC-3 o ano todo (sem horario de verao desde 2019). Data + hora.
+    return (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M")
+
+
+def _update_sheet_cn(filename):
+    """Escreve a data de hoje em 'Last Update CN' na linha do hospital."""
+    ws = _get_sheet_ws()
+    if ws is None:
+        print("[sheet] SHEET_ID/GCP_SHEETS_CREDENTIALS ausentes; planilha nao atualizada.")
+        return
+
+    rows = ws.get_all_values()
+    if not rows:
+        print("[sheet] planilha vazia.")
+        return
+
+    header = rows[0]
+    idx = {h: i for i, h in enumerate(header)}
+    if CN_COL_HEADER not in idx:
+        print(f"[sheet] coluna '{CN_COL_HEADER}' nao encontrada no cabecalho.")
+        return
+    cn_col = idx[CN_COL_HEADER]
+    match_cols = [idx[h] for h in MATCH_COL_HEADERS if h in idx]
+
+    fn = _norm(filename)
+    target_row = None
+    for r, row in enumerate(rows[1:], start=2):   # 1-based; +1 do cabecalho
+        for c in match_cols:
+            val = row[c] if c < len(row) else ""
+            if val and _norm(val) in fn:
+                target_row = r
+                break
+        if target_row:
+            break
+
+    if not target_row:
+        print(f"[sheet] hospital nao identificado no nome '{filename}'.")
+        return
+
+    today = _today_br()
+    ws.update_cell(target_row, cn_col + 1, today)  # gspread e' 1-based
+    print(f"[sheet] linha {target_row} -> {CN_COL_HEADER} = {today}")
+
+
+# ---------------------------- Fluxo principal --------------------------------
 def lambda_handler(event, context):
-    for record in event["Records"]:
+    for record in event.get("Records", []):
         s3_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
         filename = os.path.basename(s3_key)
 
         target_folder = resolve_gcp_folder(filename)
-        is_historic = target_folder == GCP_FOLDER_HISTORIC
+        is_historic = target_folder == os.environ["GCP_FOLDER_HISTORIC"]
         print(f"Arquivo: {filename} -> {'historico' if is_historic else 'diario'} ({target_folder})")
 
-        # Espera nome no formato "<algo>_<doctor_name>_<resto>"; extrai o 2o campo.
-        parts = filename.split("_", 2)
-        if len(parts) < 3:
-            print(f"Formato inesperado: {filename}")
-            continue
-        doctor_name = parts[1]
-
-        # Baixa do S3 e sobe para o GCS (mantem o original no S3).
+        # Copia S3 -> GCS (mantem o original no S3).
         tmp = f"/tmp/{filename}"
         s3_client.download_file(record["s3"]["bucket"]["name"], s3_key, tmp)
-        bucket = gcp_client.bucket(GCP_BUCKET)
-        bucket.blob(f"{target_folder}/{filename}").upload_from_filename(tmp)
-        os.remove(tmp)
+        try:
+            bucket = _get_gcs_client().bucket(os.environ["GCP_BUCKET"])
+            bucket.blob(f"{target_folder}/{filename}").upload_from_filename(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-        # ---- Registro OPCIONAL num Web App (Apps Script). Desativado por padrao. ----
-        # Requer a env var WEBAPP_URL configurada. Descomente para ativar.
-        # if WEBAPP_URL:
-        #     payload = {"name": doctor_name, "timestamp": timestamp}
-        #     try:
-        #         resp = requests.post(WEBAPP_URL, data=payload, timeout=10)
-        #         if resp.status_code == 200 and resp.text.strip() == "OK":
-        #             print(f"{doctor_name} registrado com sucesso em {timestamp}")
-        #         else:
-        #             print("Falha ao registrar no Web App:", resp.status_code, resp.text)
-        #     except Exception as e:
-        #         print("Erro ao chamar Web App:", str(e))
+        # Atualiza a planilha (Last Update CN). Falha aqui NAO quebra a copia.
+        try:
+            _update_sheet_cn(filename)
+        except Exception as e:  # noqa: BLE001
+            print(f"[sheet][warn] falha ao atualizar planilha para '{filename}': {e}")
 
     return {"statusCode": 200, "body": "Processamento concluido"}
