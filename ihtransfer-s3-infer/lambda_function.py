@@ -56,10 +56,15 @@ SPECIAL_BUCKET_HOSPITAL = {
 CN_COL_HEADER = "Last Update CN"
 MATCH_COL_HEADERS = ("cn", "Indice", "Nome do hospital")
 
+STATUS_TAB = "Como funciona (Lambdas)"
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+
 s3_client = boto3.client("s3")
 
 _gcs_client = None
+_spreadsheet = None
 _sheet_ws = None
+_status_ws = None
 
 
 # ---------------------------- GCS (upload) -----------------------------------
@@ -92,23 +97,65 @@ def _upload_name(src_bucket, filename):
 
 
 # ---------------------------- Planilha (Sheets) ------------------------------
-def _get_sheet_ws():
-    """Worksheet da planilha, ou None se as env vars da planilha nao existirem."""
-    global _sheet_ws
-    if _sheet_ws is None:
+def _get_spreadsheet():
+    """Spreadsheet (gspread), ou None se as env vars da planilha nao existirem."""
+    global _spreadsheet
+    if _spreadsheet is None:
         raw = os.environ.get("GCP_SHEETS_CREDENTIALS")
         sheet_id = os.environ.get("SHEET_ID")
         if not raw or not sheet_id:
             return None
         info = json.loads(raw)
         creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            info, scopes=[SHEETS_SCOPE]
         )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(sheet_id)
+        _spreadsheet = gspread.authorize(creds).open_by_key(sheet_id)
+    return _spreadsheet
+
+
+def _get_sheet_ws():
+    """Aba principal (Pagina1 / SHEET_NAME) com os hospitais e Last Update CN."""
+    global _sheet_ws
+    if _sheet_ws is None:
+        sh = _get_spreadsheet()
+        if sh is None:
+            return None
         name = os.environ.get("SHEET_NAME")
         _sheet_ws = sh.worksheet(name) if name else sh.sheet1
     return _sheet_ws
+
+
+def _get_status_ws():
+    """Aba de STATUS ATUAL; None se ausente (recurso desativado)."""
+    global _status_ws
+    if _status_ws is None:
+        sh = _get_spreadsheet()
+        if sh is None:
+            return None
+        try:
+            _status_ws = sh.worksheet(STATUS_TAB)
+        except gspread.WorksheetNotFound:
+            _status_ws = False
+    return _status_ws or None
+
+
+def _update_status(src_bucket, name, destino):
+    """Upsert da linha do bucket na aba de status: Ultimo arquivo / Pasta / data."""
+    ws = _get_status_ws()
+    if ws is None:
+        return
+    rows = ws.get_all_values()
+    target = None
+    for i, row in enumerate(rows, start=1):
+        if row and row[0].strip() == src_bucket:
+            target = i
+            break
+    ts = _today_br()
+    if target:
+        # atualiza so D,E,F (mantem Bucket/Hospital/Trilha semeados)
+        ws.update(range_name=f"D{target}:F{target}", values=[[name, destino, ts]])
+    else:
+        ws.append_row([src_bucket, "", "CN", name, destino, ts])
 
 
 def _norm(s):
@@ -192,5 +239,11 @@ def lambda_handler(event, context):
             _update_sheet_cn(name)
         except Exception as e:  # noqa: BLE001
             print(f"[sheet][warn] falha ao atualizar planilha para '{name}': {e}")
+
+        # Atualiza a tabela de STATUS ATUAL (ultimo arquivo/pasta por bucket).
+        try:
+            _update_status(src_bucket, name, f"{os.environ['GCP_BUCKET']}/{target_folder}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[status][warn] {e}")
 
     return {"statusCode": 200, "body": "Processamento concluido"}

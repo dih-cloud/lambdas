@@ -30,6 +30,9 @@ Para cada arquivo que chega:
    coluna **`Last Update CN`** da linha do hospital, casando pelo nome
    (`cn` → `Indice` → `Nome do hospital`, normalizado). Falha aqui **não** quebra a cópia.
 4. O objeto **original no S3 é sempre mantido**.
+5. **Status ao vivo**: faz *upsert* da linha do bucket na aba **"Como funciona (Lambdas)"**
+   (colunas `Último arquivo`, `Pasta GCS (destino)`, `Atualizado em`), mostrando pra onde
+   cada bucket está mandando no momento.
 
 > É a mesma planilha usada pela `transferBillingGCP` — lá ela preenche `Last Update
 > Billing`; aqui, `Last Update CN`.
