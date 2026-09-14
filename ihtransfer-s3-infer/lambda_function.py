@@ -1,14 +1,17 @@
 # =============================================================================
 #  LAMBDA: ihtransfer-s3-infer  (S3 -> Google Cloud Storage + update planilha CN)
 # =============================================================================
-#  Disparada por evento S3 (ObjectCreated) nos buckets de CN.
+#  Disparada por evento S3 (ObjectCreated) nos buckets de CN (us-east-1 e us-east-2).
 #  Para cada arquivo que chega:
-#    1) copia para o bucket GCS GCP_BUCKET, escolhendo a pasta pelo nome:
+#    1) Normaliza o nome: buckets que mandam formato proprio (ex.: Felicio Rocho =
+#       "DISP...CSV") sao renomeados para "cn_<hospital>_<ts>.csv" (ver
+#       SPECIAL_BUCKET_HOSPITAL) para casar pasta e planilha.
+#    2) Copia para o bucket GCS GCP_BUCKET, escolhendo a pasta pelo nome:
 #         - nome contem algum marcador de HISTORIC_FILENAME_MARKERS -> GCP_FOLDER_HISTORIC
 #         - caso contrario                                          -> GCP_FOLDER
-#    2) atualiza a planilha de acompanhamento: escreve a data de hoje
+#    3) Atualiza a planilha de acompanhamento: escreve a data de hoje
 #       (DD/MM/AAAA HH:MM) na coluna "Last Update CN" da linha do hospital,
-#       casando pelo nome do arquivo (cn -> Indice -> Nome do hospital).
+#       casando pelo nome (cn -> Indice -> Nome do hospital).
 #  O objeto original no S3 e mantido (so a copia temporaria em /tmp e removida).
 #
 #
@@ -42,6 +45,13 @@ HISTORIC_FILENAME_MARKERS = (
     "angelina", "arnaldo", "hmd", "hcor", "hbompastor",
 )
 
+# Buckets que mandam arquivos SEM o padrao "cn_<hospital>_": mapeia o bucket de
+# origem para o hospital, e o upload e' renomeado para "cn_<hospital>_<ts>.csv".
+# (Felicio Rocho envia "DISP...CSV".)
+SPECIAL_BUCKET_HOSPITAL = {
+    "shc-ingest-felicio-rocho": "Felicio Rocho",
+}
+
 # Planilha: coluna a atualizar e colunas usadas para casar o hospital.
 CN_COL_HEADER = "Last Update CN"
 MATCH_COL_HEADERS = ("cn", "Indice", "Nome do hospital")
@@ -62,11 +72,23 @@ def _get_gcs_client():
     return _gcs_client
 
 
-def resolve_gcp_folder(filename):
-    normalized = filename.casefold()
+def resolve_gcp_folder(name):
+    normalized = name.casefold()
     if any(m.casefold() in normalized for m in HISTORIC_FILENAME_MARKERS):
         return os.environ["GCP_FOLDER_HISTORIC"]
     return os.environ["GCP_FOLDER"]
+
+
+def _upload_name(src_bucket, filename):
+    """Nome usado no GCS e na planilha. Renomeia arquivos de buckets 'especiais'
+    (ex.: Felicio Rocho = DISP...) para cn_<hospital>_<ts>.csv."""
+    if filename.lower().startswith("cn_"):
+        return filename
+    hosp = SPECIAL_BUCKET_HOSPITAL.get(src_bucket)
+    if hosp:
+        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return f"cn_{hosp}_{ts}.csv"
+    return filename
 
 
 # ---------------------------- Planilha (Sheets) ------------------------------
@@ -99,7 +121,7 @@ def _today_br():
     return (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M")
 
 
-def _update_sheet_cn(filename):
+def _update_sheet_cn(name):
     """Escreve a data de hoje em 'Last Update CN' na linha do hospital."""
     ws = _get_sheet_ws()
     if ws is None:
@@ -119,19 +141,19 @@ def _update_sheet_cn(filename):
     cn_col = idx[CN_COL_HEADER]
     match_cols = [idx[h] for h in MATCH_COL_HEADERS if h in idx]
 
-    fn = _norm(filename)
+    key = _norm(name)
     target_row = None
     for r, row in enumerate(rows[1:], start=2):   # 1-based; +1 do cabecalho
         for c in match_cols:
             val = row[c] if c < len(row) else ""
-            if val and _norm(val) in fn:
+            if val and _norm(val) in key:
                 target_row = r
                 break
         if target_row:
             break
 
     if not target_row:
-        print(f"[sheet] hospital nao identificado no nome '{filename}'.")
+        print(f"[sheet] hospital nao identificado em '{name}'.")
         return
 
     today = _today_br()
@@ -142,19 +164,23 @@ def _update_sheet_cn(filename):
 # ---------------------------- Fluxo principal --------------------------------
 def lambda_handler(event, context):
     for record in event.get("Records", []):
+        src_bucket = record["s3"]["bucket"]["name"]
         s3_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
         filename = os.path.basename(s3_key)
 
-        target_folder = resolve_gcp_folder(filename)
+        # Nome normalizado (renomeia DISP... -> cn_Felicio Rocho_<ts>.csv).
+        name = _upload_name(src_bucket, filename)
+        target_folder = resolve_gcp_folder(name)
         is_historic = target_folder == os.environ["GCP_FOLDER_HISTORIC"]
-        print(f"Arquivo: {filename} -> {'historico' if is_historic else 'diario'} ({target_folder})")
+        print(f"Arquivo: {filename} -> {name} -> "
+              f"{'historico' if is_historic else 'diario'} ({target_folder})")
 
-        # Copia S3 -> GCS (mantem o original no S3).
-        tmp = f"/tmp/{filename}"
-        s3_client.download_file(record["s3"]["bucket"]["name"], s3_key, tmp)
+        # Copia S3 -> GCS (mantem o original no S3). O blob no GCS usa o nome normalizado.
+        tmp = f"/tmp/{name}"
+        s3_client.download_file(src_bucket, s3_key, tmp)
         try:
             bucket = _get_gcs_client().bucket(os.environ["GCP_BUCKET"])
-            bucket.blob(f"{target_folder}/{filename}").upload_from_filename(tmp)
+            bucket.blob(f"{target_folder}/{name}").upload_from_filename(tmp)
         finally:
             try:
                 os.remove(tmp)
@@ -163,8 +189,8 @@ def lambda_handler(event, context):
 
         # Atualiza a planilha (Last Update CN). Falha aqui NAO quebra a copia.
         try:
-            _update_sheet_cn(filename)
+            _update_sheet_cn(name)
         except Exception as e:  # noqa: BLE001
-            print(f"[sheet][warn] falha ao atualizar planilha para '{filename}': {e}")
+            print(f"[sheet][warn] falha ao atualizar planilha para '{name}': {e}")
 
     return {"statusCode": 200, "body": "Processamento concluido"}

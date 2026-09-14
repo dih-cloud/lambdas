@@ -10,21 +10,26 @@ automaticamente quando o arquivo chega no S3.
 
 ```
        (ObjectCreated, *.csv)
- buckets shc-* (CN) ─────────► Lambda ihtransfer-s3-infer ─────────► gs://<GCS_BUCKET>/<pasta>/<arquivo>
-                                    (us-east-2)                             (Google Cloud Storage)
+ buckets shc-* (CN) ─────────► Lambda ihtransfer-s3-infer ─────────► gs://<GCS_BUCKET>/cns-to-process/<arquivo>
+                              (us-east-1 e us-east-2)                    (Google Cloud Storage)
                                         │
                                         └──► planilha de acompanhamento: coluna "Last Update CN"
 ```
 
 Para cada arquivo que chega:
 
-1. Copia para o bucket GCS `GCP_BUCKET`, escolhendo a pasta pelo nome do arquivo:
+1. **Normaliza o nome**: buckets que mandam formato próprio (ex.: Felício Rocho envia
+   `DISP…CSV`) são renomeados para `cn_<hospital>_<ts>.csv` via `SPECIAL_BUCKET_HOSPITAL`
+   (mapa bucket→hospital), pra casar pasta e planilha.
+2. Copia para o bucket GCS `GCP_BUCKET`, escolhendo a pasta pelo nome:
    - contém algum marcador de `HISTORIC_FILENAME_MARKERS` → `GCP_FOLDER_HISTORIC`
    - caso contrário → `GCP_FOLDER`
-2. **Atualiza a planilha**: escreve a data de hoje (DD/MM/AAAA HH:MM, fuso Brasil) na
-   coluna **`Last Update CN`** da linha do hospital, casando pelo nome do arquivo
+   Como todos os hospitais de CN estão nos marcadores, na prática vão para
+   `GCP_FOLDER_HISTORIC` (`cns-to-process`).
+3. **Atualiza a planilha**: escreve a data de hoje (DD/MM/AAAA HH:MM, fuso Brasil) na
+   coluna **`Last Update CN`** da linha do hospital, casando pelo nome
    (`cn` → `Indice` → `Nome do hospital`, normalizado). Falha aqui **não** quebra a cópia.
-3. O objeto **original no S3 é sempre mantido**.
+4. O objeto **original no S3 é sempre mantido**.
 
 > É a mesma planilha usada pela `transferBillingGCP` — lá ela preenche `Last Update
 > Billing`; aqui, `Last Update CN`.
@@ -33,17 +38,21 @@ Para cada arquivo que chega:
 
 ## Escopo atual (produção)
 
-- Região implantada com o update de planilha: **us-east-2**.
-- Buckets de origem (gatilho `s3:ObjectCreated:*`, sufixo `.csv`): `shc-ibcc`,
-  `shc-uopeccan`, `shc-drarnaldo`, `shc-hmd`, `shc-ingest-imip`,
-  `shc-ingest-hac-angelina`, `shc-hospitalbompastor`. Arquivos no formato
-  `cn_<hospital>_<ts>.csv`.
-- Bucket GCS destino: `shc-infer-mt` (pastas `cns-for-processing` / `cns-to-process`).
+Implantada e ativa (código + update de planilha) em **us-east-2 e us-east-1** — mesmo
+código nas duas regiões.
 
-> **Nota us-east-1**: existe uma cópia desta função em us-east-1 (buckets
-> `shc-hcor-patologia`, `shc-ingest-felicio-rocho`, `shc-ingest-hamor`) que **não** foi
-> alterada aqui e está com um bug de sintaxe pré-existente — fora do escopo desta versão.
-> Felício Rocho envia arquivos `DISP…` (sem `cn_<hospital>`), que **não** casam por nome.
+- **us-east-2** (buckets `cn_<hospital>_<ts>.csv`): `shc-ibcc`, `shc-uopeccan`,
+  `shc-drarnaldo`, `shc-hmd`, `shc-ingest-imip`, `shc-ingest-hac-angelina`,
+  `shc-hospitalbompastor`.
+- **us-east-1**: `shc-hcor-patologia` (`cn_HCOR_`), `shc-ingest-hamor`
+  (`cn_Hospital de Amor_`) e `shc-ingest-felicio-rocho` (`DISP…CSV` → renomeado para
+  `cn_Felicio Rocho_<ts>.csv` via `SPECIAL_BUCKET_HOSPITAL`). O deploy aqui também
+  **corrigiu** um bug de sintaxe pré-existente que deixava a função us-east-1 quebrada.
+- Bucket GCS destino: `shc-infer-mt`. Todos os CN caem em `cns-to-process`.
+
+> **Felício Rocho** está com a coleta parada desde ~junho (sem arquivos novos no S3),
+> então o `Last Update CN` dele só será preenchido quando a coleta voltar. O código já
+> está pronto para ele (rename por bucket).
 
 ---
 
